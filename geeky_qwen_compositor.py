@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter, ImageDraw, ImageChops
 import json
 
 class GeekyQwenCompositor:
@@ -60,44 +60,75 @@ class GeekyQwenCompositor:
         # Extract metadata
         original_width, original_height = metadata["original_size"]
         segment_x, segment_y, segment_width, segment_height = metadata["segment_coords"]
-        segment_size = metadata["segment_size"]
-        target_size = metadata["target_size"]
-        paste_x, paste_y = metadata["paste_offset"]
         
-        # Extract the actual edited content from the target-sized square
-        # The edited content should be at the paste offset position
-        actual_edited = edited_pil.crop((
-            paste_x,
-            paste_y,
-            paste_x + segment_size[0],
-            paste_y + segment_size[1]
-        ))
+        # Get the original segment size and current edited size
+        segment_original_size = metadata.get("segment_original_size", [segment_width, segment_height])
+        segment_current_size = metadata.get("segment_current_size", [edited_pil.width, edited_pil.height])
         
-        # Resize the edited segment back to original segment size
-        if actual_edited.size != (segment_width, segment_height):
-            actual_edited = actual_edited.resize((segment_width, segment_height), Image.Resampling.LANCZOS)
+        # Ensure original is RGB for proper compositing
+        if original_pil.mode == 'RGBA':
+            # Convert RGBA original to RGB with white background
+            background = Image.new('RGB', original_pil.size, (255, 255, 255))
+            background.paste(original_pil, (0, 0), original_pil)
+            original_pil = background
+        elif original_pil.mode != 'RGB':
+            original_pil = original_pil.convert('RGB')
+        
+        # Handle alpha channel in edited segment
+        has_alpha = edited_pil.mode in ('RGBA', 'LA')
+        if not has_alpha and edited_pil.mode != 'RGB':
+            edited_pil = edited_pil.convert('RGB')
+        
+        # Resize the edited segment back to original segment size if needed
+        if edited_pil.size != (segment_width, segment_height):
+            # Use high-quality resampling and preserve alpha if present
+            if has_alpha:
+                edited_pil = edited_pil.resize((segment_width, segment_height), Image.Resampling.LANCZOS)
+            else:
+                edited_pil = edited_pil.resize((segment_width, segment_height), Image.Resampling.LANCZOS)
         
         # Apply feathering if requested
         if feather_edges > 0:
-            actual_edited = self.apply_feather(actual_edited, feather_edges)
+            edited_pil = self.apply_feather(edited_pil, feather_edges)
+            has_alpha = True  # Feathering creates alpha
         
         # Create a copy of the original image
         result = original_pil.copy()
         
-        # Apply blend mode and opacity
+        # Apply blend mode and opacity if needed
         if blend_mode != "normal" or opacity != 1.0:
-            actual_edited = self.apply_blend_mode(actual_edited, 
-                                                 original_pil.crop((segment_x, segment_y, 
-                                                                   segment_x + segment_width, 
-                                                                   segment_y + segment_height)),
-                                                 blend_mode, opacity)
+            # Get the original segment from the background for blending
+            original_segment = original_pil.crop((segment_x, segment_y, 
+                                                 segment_x + segment_width, 
+                                                 segment_y + segment_height))
+            edited_pil = self.apply_blend_mode(edited_pil, original_segment, blend_mode, opacity)
         
-        # Paste the edited segment back onto the original
-        result.paste(actual_edited, (segment_x, segment_y))
+        # Handle alpha channel compositing
+        if has_alpha or edited_pil.mode == 'RGBA':
+            # For alpha channel images, use alpha compositing
+            result_rgba = result.convert('RGBA')
+            if edited_pil.mode != 'RGBA':
+                edited_pil = edited_pil.convert('RGBA')
+            
+            # Create a temporary canvas for the segment
+            temp_canvas = Image.new('RGBA', result_rgba.size, (0, 0, 0, 0))
+            temp_canvas.paste(edited_pil, (segment_x, segment_y), edited_pil)
+            
+            # Alpha composite
+            result_rgba = Image.alpha_composite(result_rgba, temp_canvas)
+            
+            # Convert back to RGB
+            final_result = Image.new('RGB', result_rgba.size, (255, 255, 255))
+            final_result.paste(result_rgba, (0, 0), result_rgba)
+            result = final_result
+        else:
+            # For non-alpha images, use regular paste
+            result.paste(edited_pil, (segment_x, segment_y))
         
         # Convert back to tensor
         result_tensor = self.pil_to_tensor(result)
         
+        print(f"🔧 Composited: {edited_pil.mode} segment back to {result.mode} image")
         return (result_tensor,)
     
     def tensor_to_pil(self, tensor):
@@ -119,48 +150,87 @@ class GeekyQwenCompositor:
         from PIL import ImageFilter, ImageDraw
         
         # Create a mask for feathering
-        mask = Image.new('L', image.size, 255)
+        mask = Image.new('L', image.size, 0)
         draw = ImageDraw.Draw(mask)
         
-        # Draw a rectangle with feathered edges
+        # Create a gradient mask from edges
+        width, height = image.size
+        
+        # Fill the center area with full opacity
+        inner_rect = [feather_radius, feather_radius, 
+                     width - feather_radius, height - feather_radius]
+        
+        if inner_rect[0] < inner_rect[2] and inner_rect[1] < inner_rect[3]:
+            draw.rectangle(inner_rect, fill=255)
+        
+        # Create gradient edges
         for i in range(feather_radius):
             alpha = int(255 * (i + 1) / feather_radius)
-            draw.rectangle([i, i, image.size[0] - i - 1, image.size[1] - i - 1], 
-                          outline=alpha, width=1)
+            # Top edge
+            if i < height:
+                draw.rectangle([feather_radius, i, width - feather_radius, i + 1], fill=alpha)
+            # Bottom edge  
+            if height - i - 1 >= 0:
+                draw.rectangle([feather_radius, height - i - 1, width - feather_radius, height - i], fill=alpha)
+            # Left edge
+            if i < width:
+                draw.rectangle([i, feather_radius, i + 1, height - feather_radius], fill=alpha)
+            # Right edge
+            if width - i - 1 >= 0:
+                draw.rectangle([width - i - 1, feather_radius, width - i, height - feather_radius], fill=alpha)
         
         # Apply Gaussian blur to smooth the mask
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_radius/2))
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_radius/3))
         
         # Apply the mask to the image
         result = Image.new('RGBA', image.size, (0, 0, 0, 0))
+        if image.mode != 'RGBA':
+            image = image.convert('RGBA')
         result.paste(image, (0, 0))
         result.putalpha(mask)
         
-        # Convert back to RGB with white background
-        final = Image.new('RGB', image.size, (255, 255, 255))
-        final.paste(result, (0, 0), result)
-        
-        return final
+        return result
     
     def apply_blend_mode(self, top_image, bottom_image, blend_mode, opacity):
         """Apply various blend modes between two images"""
         from PIL import ImageChops
         
-        if blend_mode == "normal":
-            result = top_image
-        elif blend_mode == "multiply":
-            result = ImageChops.multiply(bottom_image, top_image)
-        elif blend_mode == "screen":
-            result = ImageChops.screen(bottom_image, top_image)
-        elif blend_mode == "overlay":
-            result = ImageChops.overlay(bottom_image, top_image)
-        elif blend_mode == "soft_light":
-            result = ImageChops.soft_light(bottom_image, top_image)
+        # Ensure both images are the same size
+        if top_image.size != bottom_image.size:
+            top_image = top_image.resize(bottom_image.size, Image.Resampling.LANCZOS)
+        
+        # Convert to RGB if needed for blending
+        if top_image.mode == 'RGBA':
+            # For RGBA images, we need to handle alpha separately
+            top_rgb = Image.new('RGB', top_image.size, (255, 255, 255))
+            top_rgb.paste(top_image, (0, 0), top_image)
+            top_alpha = top_image.split()[-1]
         else:
-            result = top_image
+            top_rgb = top_image.convert('RGB')
+            top_alpha = None
+            
+        bottom_rgb = bottom_image.convert('RGB')
+        
+        if blend_mode == "normal":
+            result = top_rgb
+        elif blend_mode == "multiply":
+            result = ImageChops.multiply(bottom_rgb, top_rgb)
+        elif blend_mode == "screen":
+            result = ImageChops.screen(bottom_rgb, top_rgb)
+        elif blend_mode == "overlay":
+            result = ImageChops.overlay(bottom_rgb, top_rgb)
+        elif blend_mode == "soft_light":
+            result = ImageChops.soft_light(bottom_rgb, top_rgb)
+        else:
+            result = top_rgb
         
         if opacity < 1.0:
             # Blend with original based on opacity
-            result = Image.blend(bottom_image, result, opacity)
+            result = Image.blend(bottom_rgb, result, opacity)
+        
+        # Restore alpha channel if it existed
+        if top_alpha:
+            result = result.convert('RGBA')
+            result.putalpha(top_alpha)
         
         return result

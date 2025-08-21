@@ -147,7 +147,7 @@ class GeekyQwenSegmentLoader:
             grid_spacing, show_coordinates
         )
         
-        # Extract the segment
+        # Extract the segment - ONLY the cropped section, no padding
         segment_box = (
             segment_x,
             segment_y,
@@ -157,27 +157,23 @@ class GeekyQwenSegmentLoader:
         
         segment_img = img.crop(segment_box)
         
-        # Resize segment to target size while maintaining aspect ratio
-        segment_img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
-        
-        # Create a square canvas and center the image
-        final_segment = Image.new('RGB', (target_size, target_size), (0, 0, 0))
-        paste_x = (target_size - segment_img.width) // 2
-        paste_y = (target_size - segment_img.height) // 2
-        final_segment.paste(segment_img, (paste_x, paste_y))
+        # Optionally resize the segment to target size while maintaining aspect ratio
+        # But keep it as the actual cropped content, not padded to a square
+        if target_size and (segment_img.width > target_size or segment_img.height > target_size):
+            segment_img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
         
         # Convert images to tensors
         original_tensor = torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
-        segment_tensor = torch.from_numpy(np.array(final_segment).astype(np.float32) / 255.0).unsqueeze(0)
+        segment_tensor = torch.from_numpy(np.array(segment_img).astype(np.float32) / 255.0).unsqueeze(0)
         coordinate_tensor = torch.from_numpy(np.array(coordinate_preview).astype(np.float32) / 255.0).unsqueeze(0)
         
         # Create metadata for the compositor
         metadata = {
             "original_size": [original_width, original_height],
             "segment_coords": [segment_x, segment_y, segment_width, segment_height],
-            "segment_size": [segment_img.width, segment_img.height],
+            "segment_original_size": [segment_width, segment_height],  # Original cropped size
+            "segment_current_size": [segment_img.width, segment_img.height],  # After any resizing
             "target_size": target_size,
-            "paste_offset": [paste_x, paste_y],
             "grid_params": {
                 "spacing": grid_spacing,
                 "show_coords": show_coordinates
